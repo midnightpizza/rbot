@@ -68,7 +68,6 @@ begin
         result
       end
     end
-    retry
   end
 
   module GetText
