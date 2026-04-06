@@ -31,15 +31,15 @@ class MarkovPlugin < Plugin
     :default => 0.5,
     :validate => Proc.new { |v| v >= 0 },
     :desc => "Time the learning thread spends sleeping after learning a line. If set to zero, learning from files can be very CPU intensive, but also faster.")
-   Config.register Config::IntegerValue.new('markov.delay',
+  Config.register Config::IntegerValue.new('markov.delay',
     :default => 5,
     :validate => Proc.new { |v| v >= 0 },
     :desc => "Wait short time before contributing to conversation.")
-   Config.register Config::IntegerValue.new('markov.answer_addressed',
+  Config.register Config::IntegerValue.new('markov.answer_addressed',
     :default => 50,
     :validate => Proc.new { |v| (0..100).include? v },
     :desc => "Probability of answer when addressed by nick")
-   Config.register Config::ArrayValue.new('markov.ignore_patterns',
+  Config.register Config::ArrayValue.new('markov.ignore_patterns',
     :default => [],
     :desc => "Ignore these word patterns")
   Config.register Config::FloatValue.new('markov.temperature',
@@ -304,10 +304,51 @@ class MarkovPlugin < Plugin
     MARKER
   end
 
+  # Generate a completely random sentence (like rand_chat)
+  def generate_random_sentence
+    word1, word2 = MARKER, MARKER
+    output = []
+    @bot.config['markov.max_words'].times do
+      word3 = pick_word(word1, word2)
+      break if word3 == MARKER
+      output << word3
+      word1, word2 = word2, word3
+    end
+    return nil if output.length < 3
+    sentence = output.join(' ')
+    sentence[0] = sentence[0].capitalize
+    sentence << '.' unless sentence =~ /[.!?]$/
+    sentence
+  end
+
   def generate_string(word1, word2)
-    # Get starting pair
-    if word2
-      output = [word1, word2]
+    explicit_pair = !word2.nil?
+    max_attempts = 5
+
+    if explicit_pair
+      # First, try to find a key containing both words
+      matching_keys = []
+      @chains.each_key do |key|
+        matching_keys << key if key.include?(word1) && key.include?(word2)
+      end
+      if !matching_keys.empty?
+        output = matching_keys[rand(matching_keys.size)].split(/ /)
+      else
+        # No key contains both. Try random sentences.
+        attempts = 0
+        sentence = nil
+        while attempts < max_attempts
+          rand_sentence = generate_random_sentence
+          if rand_sentence && rand_sentence.downcase.include?(word1.downcase) && rand_sentence.downcase.include?(word2.downcase)
+            sentence = rand_sentence
+            break
+          end
+          attempts += 1
+        end
+        return sentence if sentence
+        # Fallback: just the two words
+        output = [word1, word2]
+      end
     else
       seed = word1.downcase
       keys = []
@@ -320,7 +361,7 @@ class MarkovPlugin < Plugin
 
     output = output.split(/ /) unless output.is_a?(Array)
 
-    # Grow ONLY forward (no backward extension)
+    # Grow forward
     while output.length < @bot.config['markov.max_words'] && output.last != MARKER
       nxt = pick_word(output[-2], output[-1])
       break if nxt == MARKER
@@ -329,8 +370,22 @@ class MarkovPlugin < Plugin
 
     output.delete(MARKER)
 
+    # For explicit pair, if we only have 2 words, try to extend further
+    if explicit_pair && output.length == 2
+      while output.length < 4 && output.last != MARKER
+        nxt = pick_word(output[-2], output[-1])
+        break if nxt == MARKER
+        output << nxt
+      end
+      output.delete(MARKER)
+    end
+
     # Quality filters
-    return nil if output.length < 3
+    if explicit_pair
+      return nil if output.length < 2
+    else
+      return nil if output.length < 3
+    end
     return nil if output.uniq.length < output.length / 2
     return nil if output.any? { |w| output.count(w) > 3 }
 
@@ -612,17 +667,9 @@ class MarkovPlugin < Plugin
   end
 
   def rand_chat(m, params)
-    # pick a random pair from the db and go from there
-    word1, word2 = MARKER, MARKER
-    output = Array.new
-    @bot.config['markov.max_words'].times do
-      word3 = pick_word(word1, word2)
-      break if word3 == MARKER
-      output << word3
-      word1, word2 = word2, word3
-    end
-    if output.length > 1
-      m.reply output.join(" ")
+    line = generate_random_sentence
+    if line
+      m.reply line
     else
       m.reply _("I can't :(")
     end
