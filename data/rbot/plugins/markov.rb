@@ -42,6 +42,10 @@ class MarkovPlugin < Plugin
    Config.register Config::ArrayValue.new('markov.ignore_patterns',
     :default => [],
     :desc => "Ignore these word patterns")
+  Config.register Config::FloatValue.new('markov.temperature',
+    :default => 0.3,
+    :validate => Proc.new { |v| v > 0 && v <= 1 },
+    :desc => "Temperature for word selection: lower = more predictable, higher = more random")
 
   MARKER = :"\r\n"
 
@@ -267,64 +271,73 @@ class MarkovPlugin < Plugin
   end
 
   # pick a word from the registry using the pair as key.
-  def pick_word(word1, word2=MARKER, chainz=@chains)
+  def pick_word(word1, word2, chainz=@chains)
     k = "#{word1} #{word2}"
     return MARKER unless chainz.key? k
-    wordlist = chainz[k]
-    pick_word_from_list wordlist
+    pick_word_from_list(chainz[k])
   end
 
-  # pick a word from weighted hash
+  # pick a word from weighted hash with temperature scaling
   def pick_word_from_list(wordlist)
     total = wordlist.first
     hash = wordlist.last
     return MARKER if total == 0
     return hash.keys.first if hash.length == 1
-    hit = rand(total)
-    ret = MARKER
-    hash.each do |k, w|
-      hit -= w
-      if hit < 0
-        ret = k
-        break
+
+    temperature = @bot.config['markov.temperature']
+    if temperature != 1.0
+      weights = hash.values.map { |w| w ** (1.0 / temperature) }
+      sum = weights.sum
+      r = rand
+      cumulative = 0.0
+      hash.keys.each_with_index do |k, i|
+        cumulative += weights[i] / sum
+        return k if r < cumulative
+      end
+    else
+      hit = rand(total)
+      hash.each do |k, w|
+        hit -= w
+        return k if hit < 0
       end
     end
-    return ret
+    MARKER
   end
 
   def generate_string(word1, word2)
-    # limit to max of markov.max_words words
+    # Get starting pair
     if word2
       output = [word1, word2]
     else
-      output = word1
+      seed = word1.downcase
       keys = []
-      @chains.each_key(output) do |key|
-        if key.downcase.include? output
-          keys << key
-        else
-          break
-        end
+      @chains.each_key do |key|
+        keys << key if key.downcase.include?(seed)
       end
       return nil if keys.empty?
       output = keys[rand(keys.size)].split(/ /)
     end
-    output = output.split(/ /) unless output.is_a? Array
-    input = [word1, word2]
-    while output.length < @bot.config['markov.max_words'] and (output.first != MARKER or output.last != MARKER) do
-      if output.last != MARKER
-        output << pick_word(output[-2], output[-1])
-      end
-      if output.first != MARKER
-        output.insert 0, pick_word(output[0], output[1], @rchains)
-      end
+
+    output = output.split(/ /) unless output.is_a?(Array)
+
+    # Grow ONLY forward (no backward extension)
+    while output.length < @bot.config['markov.max_words'] && output.last != MARKER
+      nxt = pick_word(output[-2], output[-1])
+      break if nxt == MARKER
+      output << nxt
     end
-    output.delete MARKER
-    if output == input
-      nil
-    else
-      output.join(" ")
-    end
+
+    output.delete(MARKER)
+
+    # Quality filters
+    return nil if output.length < 3
+    return nil if output.uniq.length < output.length / 2
+    return nil if output.any? { |w| output.count(w) > 3 }
+
+    sentence = output.join(' ')
+    sentence[0] = sentence[0].capitalize
+    sentence << '.' unless sentence =~ /[.!?]$/
+    sentence
   end
 
   def help(plugin, topic = '')
@@ -359,6 +372,8 @@ class MarkovPlugin < Plugin
       "markov status => show if markov is enabled, probability and amount of messages in queue for learning"
     when "probability"
       "markov probability [<percent>] => set the % chance of rbot responding to input, or display the current probability"
+    when "temperature"
+      "markov temperature [<value>] => set randomness (0.2-0.5 = coherent, 1.0 = random)"
     when "chat"
       case subtopic
       when "about"
@@ -371,7 +386,7 @@ class MarkovPlugin < Plugin
        "learn from the text in the specified <file>, optionally using the given <pattern> to filter the text.",
        "you can sample what would be learned by specifying 'testing <num> lines'"].join(' ')
     else
-      "markov plugin: listens to chat to build a markov chain, with which it can (perhaps) attempt to (inanely) contribute to 'discussion'. Sort of.. Will get a *lot* better after listening to a lot of chat. Usage: 'chat' to attempt to say something relevant to the last line of chat, if it can -- help topics: ignore, readonly, delay, status, probability, chat, chat about, learn"
+      "markov plugin: listens to chat to build a markov chain, with which it can (perhaps) attempt to (inanely) contribute to 'discussion'. Sort of.. Will get a *lot* better after listening to a lot of chat. Usage: 'chat' to attempt to say something relevant to the last line of chat, if it can -- help topics: ignore, readonly, delay, status, probability, temperature, chat, chat about, learn"
     end
   end
 
@@ -498,6 +513,20 @@ class MarkovPlugin < Plugin
     end
   end
 
+  def set_temperature(m, params)
+    if params[:temperature]
+      temp = params[:temperature].to_f
+      if temp > 0 && temp <= 1
+        @bot.config['markov.temperature'] = temp
+        m.okay
+      else
+        m.reply _("Temperature must be between 0 and 1 (exclusive 0).")
+      end
+    else
+      m.reply _("Current temperature: %{t} (lower = more predictable, higher = more random)") % { :t => @bot.config['markov.temperature'] }
+    end
+  end
+
   def disable(m, params)
     @bot.config['markov.enabled'] = false
     m.okay
@@ -564,7 +593,7 @@ class MarkovPlugin < Plugin
         end
       end
       words.sort_by { rand }.each do |word|
-        line = generate_string word.first, nil
+        line = generate_string word, nil
         if line and message.index(line) != 0
           reply_delay m, line
           return
@@ -736,6 +765,7 @@ class MarkovPlugin < Plugin
 
 end
 
+# Instantiate the plugin and map commands
 plugin = MarkovPlugin.new
 plugin.map 'markov delay :delay', :action => "set_delay"
 plugin.map 'markov delay', :action => "set_delay"
@@ -749,6 +779,9 @@ plugin.map 'markov enable', :action => "enable"
 plugin.map 'markov disable', :action => "disable"
 plugin.map 'markov status', :action => "status"
 plugin.map 'markov stats', :action => "stats"
+plugin.map 'markov temperature [:temperature]', :action => 'set_temperature',
+           :defaults => { :temperature => nil },
+           :requirements => { :temperature => /^\d+(?:\.\d+)?$/ }
 plugin.map 'chat about :seed1 [:seed2]', :action => "chat", :defaults => {:seed2 => nil}
 plugin.map 'chat', :action => "rand_chat"
 plugin.map 'markov probability [:probability]', :action => "probability",
@@ -762,4 +795,3 @@ plugin.map 'markov learn from :file [:testing [:lines lines]] [using pattern *pa
 plugin.default_auth('ignore', false)
 plugin.default_auth('probability', false)
 plugin.default_auth('learn', false)
-
