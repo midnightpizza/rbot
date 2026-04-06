@@ -1,5 +1,13 @@
 #-- vim:sw=2:et
 #++
+
+# Add mode tracking and unique ID to User objects
+module Irc
+  class User
+    attr_accessor :modes, :unique_id
+  end
+end
+
 #
 # :title: RFC 2821 Client Protocol module
 #
@@ -968,6 +976,7 @@ module Irc
       @server = Server.new
       # The User representing the client on this Server
       @user = @server.user('*!*@*')
+      @user.modes = {}   # initialize modes hash
 
       @handlers = Hash.new
 
@@ -983,6 +992,7 @@ module Irc
     def reset
       @server.clear
       @user = @server.user('*!*@*')
+      @user.modes = {}
     end
 
     # key::   server event to handle
@@ -1104,6 +1114,11 @@ module Irc
           # "This server was created <date>"
           data[:message] = argv[1]
           handle(:created, data)
+        when 42   # non‑standard unique ID (OFTC and others)
+          data[:unique_id] = argv[1]
+          @user.unique_id = data[:unique_id] if @user.nick == argv[0]
+          handle(:unique_id, data)
+          return
         when RPL_MYINFO
           # "<servername> <version> <available user modes>
           # <available channel modes>"
@@ -1121,6 +1136,7 @@ module Irc
           # on this server"
           #
           @server.parse_isupport(argv[1..-2].join(' '))
+          @server.casemap ||= :rfc1459   # set default to avoid fallback warning
           handle(:isupport, data)
         when ERR_NICKNAMEINUSE
           # "* <nick> :Nickname is already in use"
@@ -1541,42 +1557,45 @@ module Irc
       # is present e.g. for channel modes that need
       # a parameter
       data[:modes] = []
+
       case data[:target]
       when User
-        # User modes aren't currently handled internally,
-        # but we still parse them and delegate to the client
-        warning "Unhandled user mode message '#{serverstring}'"
+        # Handle user modes
         argv[1..].each do |arg|
           setting = arg[0].chr
           if '+-'.include?(setting)
-            setting = setting == '+' ? :set : :reset
-            arg[1..].each_byte do |b|
-              m = b.chr.intern
-              data[:modes] << [setting, m]
+            setting = (setting == '+') ? :set : :reset
+            arg[1..].each_char do |ch|
+              mode = ch.to_sym
+              data[:modes] << [setting, mode]
+              # Update the user's mode hash
+              if setting == :set
+                data[:target].modes[mode] = true
+              else
+                data[:target].modes.delete(mode)
+              end
             end
           else
-            # Although typically User modes don't take an argument,
-            # this is not true for all modes on all servers. Since
-            # we have no knowledge of which modes take parameters
-            # and which don't we just assign it to the last
-            # mode. This is not going to do strange things often,
-            # as usually User modes are only set one at a time
-            warning "Unhandled user mode parameter #{arg} found"
-            data[:modes].last << arg
+            # Parameter for the last mode (rare, e.g., +s <server>)
+            if data[:modes].last
+              data[:modes].last << arg
+              # Optionally store the parameter in the mode hash
+              last_mode = data[:modes].last[1]
+              data[:target].modes[last_mode] = arg
+            else
+              warning "Orphan user mode parameter: #{arg}"
+            end
           end
         end
-      when Channel
-        # array of indices in data[:modes] where parameters
-        # are needed
-        who_wants_params = []
+        # Notify client code about user mode change
+        handle(:user_mode, data)
 
+      when Channel
+        who_wants_params = []
         modes = argv[1..].dup
-        debug modes
         getting_args = false
         while (arg = modes.shift)
-          debug arg
           if getting_args
-            # getting args for previously set modes
             idx = who_wants_params.shift
             if idx.nil?
               warning "Oops, problems parsing #{serverstring.inspect}"
@@ -1585,7 +1604,6 @@ module Irc
             data[:modes][idx] << arg
             getting_args = false if who_wants_params.empty?
           else
-            debug @server.supports[:chanmodes]
             setting = :set
             arg.each_byte do |c|
               m = c.chr.intern
@@ -1597,15 +1615,15 @@ module Irc
               else
                 data[:modes] << [setting, m]
                 case m
-                when *@server.supports[:chanmodes][:typea]
+                when *@server.supports[:chanmodes][:typeA]
                   who_wants_params << data[:modes].length - 1
-                when *@server.supports[:chanmodes][:typeb]
+                when *@server.supports[:chanmodes][:typeB]
                   who_wants_params << data[:modes].length - 1
-                when *@server.supports[:chanmodes][:typec]
+                when *@server.supports[:chanmodes][:typeC]
                   if setting == :set
                     who_wants_params << data[:modes].length - 1
                   end
-                when *@server.supports[:chanmodes][:typed]
+                when *@server.supports[:chanmodes][:typeD]
                   # Nothing to do
                 when *@server.supports[:prefix][:modes]
                   who_wants_params << data[:modes].length - 1
@@ -1631,6 +1649,7 @@ module Irc
             data[:target].mode[key].send(set)
           end
         end
+
       else
         warning "Ignoring #{data[:modestring]} for unrecognized target #{argv[0]} (#{data[:target].inspect})"
       end
