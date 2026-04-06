@@ -108,12 +108,14 @@ class UrlPlugin < Plugin
   response = http.request(request)
 
   if response['Set-Cookie']
+    require 'webrick/cookie' unless defined?(WEBrick::Cookie)
     cookies = WEBrick::Cookie.parse(response['Set-Cookie'])
     cookies.each do |cookie|
       cookie_jar[cookie.name] = cookie.value
     end
   end
 
+  # Handle redirects
   if response.is_a?(Net::HTTPRedirection)
     location = response['location']
     new_uri = URI.parse(location)
@@ -126,27 +128,31 @@ class UrlPlugin < Plugin
   end
 
   body = response.body
-  # Decompress
+
+  # Decompress the response body based on Content-Encoding
   case response['content-encoding']
   when 'gzip'
     body = Zlib::GzipReader.new(StringIO.new(body)).read
   when 'deflate'
     body = Zlib::Inflate.inflate(body)
   when 'br'
-    # Brotli – skip, but log
-    debug "Brotli encoding not supported, using raw body"
+    require 'brotli'
+    body = Brotli.inflate(body)
   end
 
+  # Detect bot protection page (Cloudflare, etc.)
   if body =~ /<title[^>]*>(?:Just a moment|Attention Required|DDOS Guardian|Access Denied)<\/title>/i
-    raise "Bot protection page detected (likely Cloudflare). Cannot retrieve content."
+    raise "Bot protection page detected. Cannot retrieve content."
   end
 
+  # Extract title
   title = body.match(/<title[^>]*>(.*?)<\/title>/i)&.[](1)&.strip
   if title
     title.gsub!(/&[a-z]+;/, ' ')
     title.gsub!(/\s+/, ' ')
   end
 
+  # Extract first paragraph if enabled
   first_par = nil
   if @bot.config['url.first_par']
     if body =~ /<(?:p|div)[^>]*>(.*?)(?:<\/(?:p|div)>|$)/mi

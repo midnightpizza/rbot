@@ -17,6 +17,7 @@ group :optional do
   gem 'tzinfo' # time
   gem 'oauth' # twitter
   gem 'oauth2'
+  gem 'brotli'
 end
 
 gem "rake", "~> 13.0"
