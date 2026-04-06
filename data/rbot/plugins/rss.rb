@@ -301,6 +301,11 @@ class RSSFeedsPlugin < Plugin
     :default => 100, :validate => Proc.new{|v| v > 0 && v < 200},
     :desc => "How many characters to use of a RSS item header")
 
+  Config.register Config::IntegerValue.new('rss.max_failures',
+  :default => 5,
+  :validate => Proc.new{|v| v > 0},
+  :desc => "Maximum consecutive fetch failures before auto-unwatching a feed")
+
   Config.register Config::IntegerValue.new('rss.text_max',
     :default => 200, :validate => Proc.new{|v| v > 0 && v < 400},
     :desc => "How many characters to use of a RSS item text")
@@ -944,128 +949,170 @@ class RSSFeedsPlugin < Plugin
 
   private
   def watchRss(feed, m=nil)
-    if @watch.has_key?(feed.handle)
-      # report_problem("watcher thread for #{feed.handle} is already running", nil, m)
-      return
-    end
-    status = Hash.new
-    status[:failures] = 0
-    tmout = 0
-    if feed.last_fetched
-      tmout = feed.last_fetched + calculate_timeout(feed) - Time.now
-      tmout = 0 if tmout < 0
-    end
-    debug "scheduling a watcher for #{feed} in #{tmout} seconds"
-    @watch[feed.handle] = @bot.timer.add(tmout) {
-      debug "watcher for #{feed} wakes up"
-      failures = status[:failures]
-      begin
-        debug "fetching #{feed}"
+  if @watch.has_key?(feed.handle)
+    # report_problem("watcher thread for #{feed.handle} is already running", nil, m)
+    return
+  end
+  status = Hash.new
+  status[:failures] = 0
+  tmout = 0
+  if feed.last_fetched
+    tmout = feed.last_fetched + calculate_timeout(feed) - Time.now
+    tmout = 0 if tmout < 0
+  end
+  debug "scheduling a watcher for #{feed} in #{tmout} seconds"
+  @watch[feed.handle] = @bot.timer.add(tmout) {
+    debug "watcher for #{feed} wakes up"
+    failures = status[:failures]
+    begin
+      debug "fetching #{feed}"
 
-        first_run = !feed.last_success
-        if (!first_run && @bot.config['rss.announce_timeout'] > 0 &&
-           (Time.now - feed.last_success > @bot.config['rss.announce_timeout']))
-          debug "#{feed} wasn't polled for too long, suppressing output"
-          first_run = true
-        end
-        oldxml = feed.xml ? feed.xml.dup : nil
-        unless fetchRss(feed, nil, feed.http_cache)
-          failures += 1
-        else
-          feed.http_cache = true
-          if first_run
-            debug "first run for #{feed}, getting items"
-            parseRss(feed)
-          elsif oldxml and oldxml == feed.xml
-            debug "xml for #{feed} didn't change"
-            failures -= 1 if failures > 0
-          else
-            # This one is used for debugging
-            otxt = []
+      first_run = !feed.last_success
+      if (!first_run && @bot.config['rss.announce_timeout'] > 0 &&
+         (Time.now - feed.last_success > @bot.config['rss.announce_timeout']))
+        debug "#{feed} wasn't polled for too long, suppressing output"
+        first_run = true
+      end
+      oldxml = feed.xml ? feed.xml.dup : nil
+      unless fetchRss(feed, nil, feed.http_cache)
+        failures += 1
+        debug "fetch failed, consecutive failures: #{failures}"
 
-            if feed.items.nil?
-              oids = []
-            else
-              # These are used for checking new items vs old ones
-              oids = Set.new feed.items.map { |item|
-                uid = make_uid item
-                otxt << item.to_s
-                debug [uid, item].inspect
-                debug [uid, otxt.last].inspect
-                uid
-              }
+        # Auto‑disable if too many consecutive failures
+        max_failures = @bot.config['rss.max_failures']
+        if failures >= max_failures
+          error "Feed #{feed.handle} (#{feed.url}) failed #{failures} times, disabling watch"
+          msg = _("RSS feed %{handle} has failed %{count} times. Stopping watch.") % {
+            :handle => feed.handle,
+            :count => failures
+          }
+          # Notify all watchers
+          feed.watchers.dup.each do |loc|
+            begin
+              @bot.say(loc, msg)
+            rescue => e
+              debug "Failed to notify #{loc} about feed disable: #{e}"
             end
+            feed.rm_watch(loc)
+          end
+          # Remove the timer and clean up
+          stop_watch(feed.handle)
+          next  # exit this timer invocation
+        end
+      else
+        feed.http_cache = true
+        # Reset failure counter on any successful fetch
+        failures = 0
 
-              nitems = parseRss(feed)
-              if nitems.nil?
-                failures += 1
-              elsif nitems == 0
-                debug "no items in feed #{feed}"
+        if first_run
+          debug "first run for #{feed}, getting items"
+          parseRss(feed)
+        elsif oldxml and oldxml == feed.xml
+          debug "xml for #{feed} didn't change"
+          # failures already reset, no need to touch
+        else
+          # This one is used for debugging
+          otxt = []
+
+          if feed.items.nil?
+            oids = []
+          else
+            # These are used for checking new items vs old ones
+            oids = Set.new feed.items.map { |item|
+              uid = make_uid item
+              otxt << item.to_s
+              debug [uid, item].inspect
+              debug [uid, otxt.last].inspect
+              uid
+            }
+          end
+
+          nitems = parseRss(feed)
+          if nitems.nil?
+            failures += 1   # parse failure counts as a failure
+          elsif nitems == 0
+            debug "no items in feed #{feed}"
+          else
+            debug "Checking if new items are available for #{feed}"
+            # failures already reset above, keep them at 0
+
+            dispItems = feed.items.reject { |item|
+              uid = make_uid item
+              txt = item.to_s
+              if oids.include?(uid)
+                debug "rejecting old #{uid} #{item.inspect}"
+                debug [uid, txt].inspect
+                true
               else
-                debug "Checking if new items are available for #{feed}"
-                failures -= 1 if failures > 0
-                # debug "Old:"
-                # debug oldxml
-                # debug "New:"
-                # debug feed.xml
-
-                dispItems = feed.items.reject { |item|
-                  uid = make_uid item
-                  txt = item.to_s
-                  if oids.include?(uid)
-                    debug "rejecting old #{uid} #{item.inspect}"
-                    debug [uid, txt].inspect
-                    true
-                  else
-                    debug "accepting new #{uid} #{item.inspect}"
-                    debug [uid, txt].inspect
-                    warning "same text! #{txt}" if otxt.include?(txt)
-                    false
-                  end
-                }
-
-                if dispItems.length > 0
-                  max = @bot.config['rss.announce_max']
-                  debug "Found #{dispItems.length} new items in #{feed}"
-                  if max > 0 and dispItems.length > max
-                    debug "showing only the latest #{dispItems.length}"
-                    feed.watchers.each do |loc|
-                      @bot.say loc, (_("feed %{feed} had %{num} updates, showing the latest %{max}") % {
-                        :feed => feed.handle,
-                        :num => dispItems.length,
-                        :max => max
-                      })
-                    end
-                    dispItems.slice!(max..-1)
-                  end
-                  # When displaying watched feeds, publish them from older to newer
-                  dispItems.reverse.each { |item|
-                    printFormattedRss(feed, item)
-                  }
-                else
-                  debug "No new items found in #{feed}"
-                end
+                debug "accepting new #{uid} #{item.inspect}"
+                debug [uid, txt].inspect
+                warning "same text! #{txt}" if otxt.include?(txt)
+                false
               end
+            }
+
+            if dispItems.length > 0
+              max = @bot.config['rss.announce_max']
+              debug "Found #{dispItems.length} new items in #{feed}"
+              if max > 0 and dispItems.length > max
+                debug "showing only the latest #{dispItems.length}"
+                feed.watchers.each do |loc|
+                  @bot.say loc, (_("feed %{feed} had %{num} updates, showing the latest %{max}") % {
+                    :feed => feed.handle,
+                    :num => dispItems.length,
+                    :max => max
+                  })
+                end
+                dispItems.slice!(max..-1)
+              end
+              # When displaying watched feeds, publish them from older to newer
+              dispItems.reverse.each { |item|
+                printFormattedRss(feed, item)
+              }
+            else
+              debug "No new items found in #{feed}"
+            end
           end
         end
-      rescue Exception => e
-        error "Error watching #{feed}: #{e.inspect}"
-        debug e.backtrace.join("\n")
-        failures += 1
       end
+    rescue Exception => e
+      error "Error watching #{feed}: #{e.inspect}"
+      debug e.backtrace.join("\n")
+      failures += 1
 
-      status[:failures] = failures
-
-      seconds = calculate_timeout(feed, failures)
-      debug "watcher for #{feed} going to sleep #{seconds} seconds.."
-      begin
-        @bot.timer.reschedule(@watch[feed.handle], seconds)
-      rescue
-        warning "watcher for #{feed} failed to reschedule: #{$!.inspect}"
+      # Also auto‑disable on unexpected exceptions
+      max_failures = @bot.config['rss.max_failures']
+      if failures >= max_failures
+        error "Feed #{feed.handle} (#{feed.url}) caused exception #{failures} times, disabling watch"
+        msg = _("RSS feed %{handle} has failed %{count} times (exceptions). Stopping watch.") % {
+          :handle => feed.handle,
+          :count => failures
+        }
+        feed.watchers.dup.each do |loc|
+          begin
+            @bot.say(loc, msg)
+          rescue => e2
+            debug "Failed to notify #{loc} about feed disable: #{e2}"
+          end
+          feed.rm_watch(loc)
+        end
+        stop_watch(feed.handle)
+        next
       end
-    }
-    debug "watcher for #{feed} added"
-  end
+    end
+
+    status[:failures] = failures
+
+    seconds = calculate_timeout(feed, failures)
+    debug "watcher for #{feed} going to sleep #{seconds} seconds.."
+    begin
+      @bot.timer.reschedule(@watch[feed.handle], seconds)
+    rescue
+      warning "watcher for #{feed} failed to reschedule: #{$!.inspect}"
+    end
+  }
+  debug "watcher for #{feed} added"
+end
 
   def calculate_timeout(feed, failures = 0)
       seconds = @bot.config['rss.thread_sleep']
