@@ -4,12 +4,18 @@
 # :title: Url plugin
 
 require 'socket'
+require 'net/http'
+require 'uri'
+require 'zlib'
+require 'stringio'
+require 'webrick/cookie'
 
 define_structure :Url, :channel, :nick, :time, :url, :info
 
 class UrlPlugin < Plugin
   LINK_INFO = "[Link Info]"
   OUR_UNSAFE = Regexp.new("[^#{URI::PATTERN::UNRESERVED}#{URI::PATTERN::RESERVED}%# ]", false, 'N')
+  USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
   Config.register Config::IntegerValue.new('url.max_urls',
     :default => 100, :validate => Proc.new{|v| v > 0},
@@ -69,87 +75,156 @@ class UrlPlugin < Plugin
     "url info <url> => display link info for <url> (set url.display_link_info > 0 if you want the bot to do it automatically when someone writes an url), urls [<max>=4] => list <max> last urls mentioned in current channel, urls search [<max>=4] <regexp> => search for matching urls. In a private message, you must specify the channel to query, eg. urls <channel> [max], urls search <channel> [max] <regexp>"
   end
 
+ def robust_fetch(url_str, redirect_limit = 5, cookie_jar = {})
+  raise "Too many redirects" if redirect_limit == 0
+
+  uri = URI.parse(url_str)
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = (uri.scheme == 'https')
+  http.open_timeout = 10
+  http.read_timeout = 10
+  http.ssl_version = :TLSv1_2 if http.use_ssl?
+
+  request = Net::HTTP::Get.new(uri.request_uri)
+
+  request['User-Agent'] = USER_AGENT
+  request['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
+  request['Accept-Language'] = 'en-US,en;q=0.9'
+  request['Accept-Encoding'] = 'gzip, deflate, br'
+  request['Connection'] = 'keep-alive'
+  request['Upgrade-Insecure-Requests'] = '1'
+  request['Sec-Fetch-Dest'] = 'document'
+  request['Sec-Fetch-Mode'] = 'navigate'
+  request['Sec-Fetch-Site'] = 'none'
+  request['Sec-Fetch-User'] = '?1'
+  request['Cache-Control'] = 'max-age=0'
+  request['Referer'] = "https://www.google.com/"
+
+  unless cookie_jar.empty?
+    cookie_header = cookie_jar.map { |name, value| "#{name}=#{value}" }.join('; ')
+    request['Cookie'] = cookie_header
+  end
+
+  response = http.request(request)
+
+  if response['Set-Cookie']
+    cookies = WEBrick::Cookie.parse(response['Set-Cookie'])
+    cookies.each do |cookie|
+      cookie_jar[cookie.name] = cookie.value
+    end
+  end
+
+  if response.is_a?(Net::HTTPRedirection)
+    location = response['location']
+    new_uri = URI.parse(location)
+    new_uri = uri.merge(new_uri) if new_uri.relative?
+    return robust_fetch(new_uri.to_s, redirect_limit - 1, cookie_jar)
+  end
+
+  unless response.is_a?(Net::HTTPSuccess)
+    raise "#{response.code} - #{response.message}"
+  end
+
+  body = response.body
+  # Decompress
+  case response['content-encoding']
+  when 'gzip'
+    body = Zlib::GzipReader.new(StringIO.new(body)).read
+  when 'deflate'
+    body = Zlib::Inflate.inflate(body)
+  when 'br'
+    # Brotli – skip, but log
+    debug "Brotli encoding not supported, using raw body"
+  end
+
+  if body =~ /<title[^>]*>(?:Just a moment|Attention Required|DDOS Guardian|Access Denied)<\/title>/i
+    raise "Bot protection page detected (likely Cloudflare). Cannot retrieve content."
+  end
+
+  title = body.match(/<title[^>]*>(.*?)<\/title>/i)&.[](1)&.strip
+  if title
+    title.gsub!(/&[a-z]+;/, ' ')
+    title.gsub!(/\s+/, ' ')
+  end
+
+  first_par = nil
+  if @bot.config['url.first_par']
+    if body =~ /<(?:p|div)[^>]*>(.*?)(?:<\/(?:p|div)>|$)/mi
+      first_par = $1.strip.gsub(/<[^>]+>/, '').gsub(/\s+/, ' ')
+      first_par = first_par[0...@bot.config['url.first_par_length']]
+    end
+  end
+
+  {
+    headers: response.each_header.to_h,
+    title: title,
+    content: first_par,
+    body: body
+  }
+end
+
   def get_title_from_html(pagedata)
     return pagedata.ircify_html_title
   end
 
   def get_title_for_url(uri_str, opts = {})
-
     url = uri_str.kind_of?(URI) ? uri_str : URI.parse(uri_str)
     return if url.scheme !~ /https?/
 
-    # also check the ip, the canonical name and the aliases
     begin
       checks = Addrinfo.getaddrinfo(url.host, nil).map { |addr| addr.ip_address }
     rescue => e
       return "Unable to retrieve info for #{url.host}: #{e.message}"
     end
-
     checks << url.host
     checks.flatten!
-
     unless checks.grep(@no_info_hosts).empty?
       return ( opts[:always_reply] ? "Sorry, info retrieval for #{url.host} (#{checks.first}) is disabled" : false )
     end
 
-    logopts = opts.dup
-
-    title = nil
-    extra = []
-
     begin
-      debug "+ getting info for #{url.request_uri}"
-      info = @bot.filter(:htmlinfo, url)
-      logopts[:htmlinfo] = info
-      resp = info[:headers]
-
-      logopts[:title] = title = info[:title]
-
-      if info[:content]
-        logopts[:extra] = info[:content]
-
-        max_length = @bot.config['url.first_par_length']
-
-        whitelist = @bot.config['url.first_par_whitelist']
-        content = nil
-        if whitelist.length > 0
-          whitelist.each do |pattern|
-            if Regexp.new(pattern, Regexp::IGNORECASE).match(url.to_s)
-              content = info[:content][0...max_length]
-              break
-            end
-          end
-        else
-          content = info[:content][0...max_length]
-        end
-
-        extra << "#{Bold}text#{Bold}: #{content}" if @bot.config['url.first_par'] and content
-      else
-        logopts[:extra] = String.new
-        logopts[:extra] << "Content Type: #{resp['content-type']}"
-        extra << "#{Bold}type#{Bold}: #{resp['content-type']}" unless title
-        if enc = resp['content-encoding']
-          logopts[:extra] << ", encoding: #{enc}"
-          extra << "#{Bold}encoding#{Bold}: #{enc}" if @bot.config['url.first_par'] or not title
-        end
-
-        size = resp['content-length'].first.gsub(/(\d)(?=\d{3}+(?:\.|$))(\d{3}\..*)?/,'\1,\2') rescue nil
-        if size
-          logopts[:extra] << ", size: #{size} bytes"
-          extra << "#{Bold}size#{Bold}: #{size} bytes" if @bot.config['url.first_par'] or not title
-        end
-      end
-    rescue Exception => e
-      case e
-      when UrlLinkError
-        raise e
-      else
-        error e
+      info = robust_fetch(url.to_s)
+    rescue => e
+      debug "robust_fetch failed: #{e.message}"
+      # Fallback to the original filter
+      begin
+        info = @bot.filter(:htmlinfo, url)
+      rescue => e
         raise "connecting to site/processing information (#{e.message})"
       end
     end
 
-    call_event(:url_added, url.to_s, logopts)
+    title = info[:title]
+    extra = []
+    resp = info[:headers]
+
+    if info[:content]
+      max_length = @bot.config['url.first_par_length']
+      whitelist = @bot.config['url.first_par_whitelist']
+      content = nil
+      if whitelist.length > 0
+        whitelist.each do |pattern|
+          if Regexp.new(pattern, Regexp::IGNORECASE).match(url.to_s)
+            content = info[:content][0...max_length]
+            break
+          end
+        end
+      else
+        content = info[:content][0...max_length] if @bot.config['url.first_par']
+      end
+      extra << "#{Bold}text#{Bold}: #{content}" if content
+    else
+      extra << "#{Bold}type#{Bold}: #{resp['content-type']}" unless title
+      if enc = resp['content-encoding']
+        extra << "#{Bold}encoding#{Bold}: #{enc}" if @bot.config['url.first_par'] or not title
+      end
+      if size = resp['content-length']
+        size = size.gsub(/(\d)(?=\d{3}+(?:\.|$))(\d{3}\..*)?/,'\1,\2') rescue nil
+        extra << "#{Bold}size#{Bold}: #{size} bytes" if size && (@bot.config['url.first_par'] or not title)
+      end
+    end
+
+    call_event(:url_added, url.to_s, { title: title, extra: extra.join(", ") })
     if title
       extra.unshift("#{Bold}title#{Bold}: #{title}")
     end
