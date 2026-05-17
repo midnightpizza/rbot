@@ -376,7 +376,11 @@ class UrlPlugin < Plugin
   def get_title_for_url(uri_str, opts = {})
     url = uri_str.kind_of?(URI) ? uri_str : URI.parse(uri_str)
     return if url.scheme !~ /https?/
-
+    if url.host =~ /(^|\.)xcancel\.com$/ii
+      original = url.to_s
+      url.host = 'x.com'
+      debug "Rewrote #{original} → #{url}"
+    end
     begin
       checks = Addrinfo.getaddrinfo(url.host, nil).map { |addr| addr.ip_address }
     rescue => e
