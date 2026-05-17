@@ -1,6 +1,7 @@
 #-- vim:sw=2:et
 #++
-#
+# # added flare solverr podman run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+# config set url.flaresolverr http://127.0.0.1:8191/v1
 # :title: Url plugin
 
 require 'socket'
@@ -9,6 +10,7 @@ require 'uri'
 require 'zlib'
 require 'stringio'
 require 'webrick/cookie'
+require 'json'
 
 define_structure :Url, :channel, :nick, :time, :url, :info
 
@@ -16,6 +18,34 @@ class UrlPlugin < Plugin
   LINK_INFO = "[Link Info]"
   OUR_UNSAFE = Regexp.new("[^#{URI::PATTERN::UNRESERVED}#{URI::PATTERN::RESERVED}%# ]", false, 'N')
   USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+ def extract_youtube_title(body)
+    if body =~ /<script\s+type=["']application\/ld\+json["'][^>]*>(.*?)<\/script>/im
+      json_ld = $1
+      begin
+        data = JSON.parse(json_ld)
+        if data.is_a?(Array)
+          data.each do |item|
+            if item['@type'] == 'VideoObject' && item['name']
+              return item['name']
+            end
+          end
+        elsif data.is_a?(Hash) && data['@type'] == 'VideoObject' && data['name']
+          return data['name']
+        end
+      rescue JSON::ParserError => e
+        debug "JSON-LD parse failed: #{e.message}"
+      end
+    end
+    nil
+  end
+
+  # Public Nitter instances fallback
+  NITTER_INSTANCES = [
+    'nitter.net',
+    'nitter.poast.org',
+    'nitter.1d4.us',
+    'xcancel.com'
+  ]
 
   Config.register Config::IntegerValue.new('url.max_urls',
     :default => 100, :validate => Proc.new{|v| v > 0},
@@ -55,6 +85,10 @@ class UrlPlugin < Plugin
     :desc => "Don't show link info for urls from users represented as hostmasks on this list. Useful for ignoring other bots, for example.",
     :default => [])
 
+  Config.register Config::StringValue.new('url.flaresolverr',
+    :default => 'http://localhost:8191/v1',
+    :desc => "URL of a FlareSolverr instance. Set to empty string to disable Cloudflare bypass.")
+
   def initialize
     super
     @registry.set_default(Array.new)
@@ -64,6 +98,28 @@ class UrlPlugin < Plugin
     reset_no_info_hosts
     self.filter_group = :htmlinfo
     load_filters
+
+    @flaresolverr_failures = 0
+    @flaresolverr_disabled = false
+    @flaresolverr_max_failures = 5
+
+    if @bot.config['url.flaresolverr'] && !@bot.config['url.flaresolverr'].empty?
+      Thread.new do
+        begin
+          uri = URI.parse(@bot.config['url.flaresolverr'])
+          http = Net::HTTP.new(uri.host, uri.port)
+          http.use_ssl = (uri.scheme == 'https')
+          http.open_timeout = 3
+          http.read_timeout = 3
+          http.start do |h|
+            h.request_get('/v1')
+          end
+          log "FlareSolverr probe successful"
+        rescue StandardError => e
+          log "FlareSolverr probe failed: #{e.message} – it will be used when needed and disabled after #{@flaresolverr_max_failures} consecutive failures"
+        end
+      end
+    end
   end
 
   def reset_no_info_hosts
@@ -72,105 +128,248 @@ class UrlPlugin < Plugin
   end
 
   def help(plugin, topic = '')
-    "url info <url> => display link info for <url> (set url.display_link_info > 0 if you want the bot to do it automatically when someone writes an url), urls [<max>=4] => list <max> last urls mentioned in current channel, urls search [<max>=4] <regexp> => search for matching urls. In a private message, you must specify the channel to query, eg. urls <channel> [max], urls search <channel> [max] <regexp>"
+    "url info <url> => display link info for <url> (set url.display_link_info > 0 if you want the bot to do it automatically when someone writes an url), urls [<max>=4] => list <max> last urls mentioned in current channel, urls search [<max>=4] <regexp> => search for matching urls. In a private message, you must specify the channel to query, eg. urls <channel> [max], urls search <channel> [max] <regexp>. url flaresolverr reset => re-enable FlareSolverr after it has been automatically disabled."
   end
 
- def robust_fetch(url_str, redirect_limit = 5, cookie_jar = {})
-  raise "Too many redirects" if redirect_limit == 0
+  def fetch_via_flaresolverr(url_str, flaresolverr_url)
+    if @flaresolverr_disabled
+      raise "FlareSolverr temporarily disabled due to repeated failures"
+    end
 
-  uri = URI.parse(url_str)
-  http = Net::HTTP.new(uri.host, uri.port)
-  http.use_ssl = (uri.scheme == 'https')
-  http.open_timeout = 10
-  http.read_timeout = 10
-  http.ssl_version = :TLSv1_2 if http.use_ssl?
+    uri = URI.parse(flaresolverr_url)
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = (uri.scheme == 'https')
+    http.open_timeout = 15
+    http.read_timeout = 15
+    headers = { 'Content-Type' => 'application/json' }
+    payload = {
+      cmd: 'request.get',
+      url: url_str,
+      maxTimeout: 30000,
+      session: 'rbot_twitter_session'
+    }.to_json
 
-  request = Net::HTTP::Get.new(uri.request_uri)
+    begin
+      debug "Requesting FlareSolverr: #{flaresolverr_url}"
+      response = http.post(uri.request_uri, payload, headers)
+    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH, SocketError, Net::OpenTimeout => e
+      @flaresolverr_failures += 1
+      if @flaresolverr_failures >= @flaresolverr_max_failures
+        @flaresolverr_disabled = true
+        log "FlareSolverr disabled after #{@flaresolverr_max_failures} consecutive failures"
+      end
+      raise "FlareSolverr connection failed (#{e.message})"
+    end
 
-  request['User-Agent'] = USER_AGENT
-  request['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
-  request['Accept-Language'] = 'en-US,en;q=0.9'
-  request['Accept-Encoding'] = 'gzip, deflate, br'
-  request['Connection'] = 'keep-alive'
-  request['Upgrade-Insecure-Requests'] = '1'
-  request['Sec-Fetch-Dest'] = 'document'
-  request['Sec-Fetch-Mode'] = 'navigate'
-  request['Sec-Fetch-Site'] = 'none'
-  request['Sec-Fetch-User'] = '?1'
-  request['Cache-Control'] = 'max-age=0'
-  request['Referer'] = "https://www.google.com/"
-
-  unless cookie_jar.empty?
-    cookie_header = cookie_jar.map { |name, value| "#{name}=#{value}" }.join('; ')
-    request['Cookie'] = cookie_header
-  end
-
-  response = http.request(request)
-
-  if response['Set-Cookie']
-    require 'webrick/cookie' unless defined?(WEBrick::Cookie)
-    cookies = WEBrick::Cookie.parse(response['Set-Cookie'])
-    cookies.each do |cookie|
-      cookie_jar[cookie.name] = cookie.value
+    if response.is_a?(Net::HTTPSuccess)
+      result = JSON.parse(response.body)
+      if result['status'] == 'ok'
+        @flaresolverr_failures = 0
+        @flaresolverr_disabled = false
+        solution = result['solution']
+        debug "FlareSolverr success, returned #{solution['response'].length} bytes"
+        return {
+          body: solution['response'],
+          headers: solution['headers'] || {},
+          title: nil,
+          content: nil
+        }
+      else
+        @flaresolverr_failures += 1
+        if @flaresolverr_failures >= @flaresolverr_max_failures
+          @flaresolverr_disabled = true
+          log "FlareSolverr disabled after #{@flaresolverr_max_failures} consecutive failures"
+        end
+        raise "FlareSolverr error: #{result['message']}"
+      end
+    else
+      @flaresolverr_failures += 1
+      if @flaresolverr_failures >= @flaresolverr_max_failures
+        @flaresolverr_disabled = true
+        log "FlareSolverr disabled after #{@flaresolverr_max_failures} consecutive failures"
+      end
+      raise "FlareSolverr HTTP error #{response.code}"
     end
   end
 
-  # Handle redirects
-  if response.is_a?(Net::HTTPRedirection)
-    location = response['location']
-    new_uri = URI.parse(location)
-    new_uri = uri.merge(new_uri) if new_uri.relative?
-    return robust_fetch(new_uri.to_s, redirect_limit - 1, cookie_jar)
-  end
+   def robust_fetch(url_str, redirect_limit = 5, cookie_jar = {})
+    raise "Too many redirects" if redirect_limit == 0
 
-  unless response.is_a?(Net::HTTPSuccess)
-    raise "#{response.code} - #{response.message}"
-  end
+    uri = URI.parse(url_str)
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = (uri.scheme == 'https')
+    http.open_timeout = 10
+    http.read_timeout = 10
+    http.ssl_version = :TLSv1_2 if http.use_ssl?
 
-  body = response.body
+    request = Net::HTTP::Get.new(uri.request_uri)
 
-  # Decompress the response body based on Content-Encoding
-  case response['content-encoding']
-  when 'gzip'
-    body = Zlib::GzipReader.new(StringIO.new(body)).read
-  when 'deflate'
-    body = Zlib::Inflate.inflate(body)
-  when 'br'
-    require 'brotli'
-    body = Brotli.inflate(body)
-  end
+    request['User-Agent'] = USER_AGENT
+    request['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
+    request['Accept-Language'] = 'en-US,en;q=0.9'
+    request['Accept-Encoding'] = 'gzip, deflate, br'
+    request['Connection'] = 'keep-alive'
+    request['Upgrade-Insecure-Requests'] = '1'
+    request['Sec-Fetch-Dest'] = 'document'
+    request['Sec-Fetch-Mode'] = 'navigate'
+    request['Sec-Fetch-Site'] = 'none'
+    request['Sec-Fetch-User'] = '?1'
+    request['Cache-Control'] = 'max-age=0'
+    request['Referer'] = "https://www.google.com/"
 
-  # Detect bot protection page (Cloudflare, etc.)
-  if body =~ /<title[^>]*>(?:Just a moment|Attention Required|DDOS Guardian|Access Denied)<\/title>/i
-    raise "Bot protection page detected. Cannot retrieve content."
-  end
-
-  # Extract title
-  title = body.match(/<title[^>]*>(.*?)<\/title>/i)&.[](1)&.strip
-  if title
-    title.gsub!(/&[a-z]+;/, ' ')
-    title.gsub!(/\s+/, ' ')
-  end
-
-  # Extract first paragraph if enabled
-  first_par = nil
-  if @bot.config['url.first_par']
-    if body =~ /<(?:p|div)[^>]*>(.*?)(?:<\/(?:p|div)>|$)/mi
-      first_par = $1.strip.gsub(/<[^>]+>/, '').gsub(/\s+/, ' ')
-      first_par = first_par[0...@bot.config['url.first_par_length']]
+    unless cookie_jar.empty?
+      cookie_header = cookie_jar.map { |name, value| "#{name}=#{value}" }.join('; ')
+      request['Cookie'] = cookie_header
     end
-  end
 
-  {
-    headers: response.each_header.to_h,
-    title: title,
-    content: first_par,
-    body: body
-  }
-end
+    response = http.request(request)
+
+    if response['Set-Cookie']
+      require 'webrick/cookie' unless defined?(WEBrick::Cookie)
+      cookies = WEBrick::Cookie.parse(response['Set-Cookie'])
+      cookies.each do |cookie|
+        cookie_jar[cookie.name] = cookie.value
+      end
+    end
+
+    if response.is_a?(Net::HTTPRedirection)
+      location = response['location']
+      new_uri = URI.parse(location)
+      new_uri = uri.merge(new_uri) if new_uri.relative?
+      return robust_fetch(new_uri.to_s, redirect_limit - 1, cookie_jar)
+    end
+
+    # Handle 403 and FlareSolverr
+    unless response.is_a?(Net::HTTPSuccess)
+      if response.code.to_i == 403 &&
+         @bot.config['url.flaresolverr'] &&
+         !@bot.config['url.flaresolverr'].empty?
+        debug "403 Forbidden – trying FlareSolverr..."
+        return fetch_via_flaresolverr(url_str, @bot.config['url.flaresolverr'])
+      elsif response.code.to_i == 403
+        raise "Site blocked retrieval (403 Forbidden)"
+      else
+        raise "#{response.code} - #{response.message}"
+      end
+    end
+
+    body = response.body
+
+    case response['content-encoding']
+    when 'gzip'
+      body = Zlib::GzipReader.new(StringIO.new(body)).read
+    when 'deflate'
+      body = Zlib::Inflate.inflate(body)
+    when 'br'
+      require 'brotli'
+      body = Brotli.inflate(body)
+    end
+
+    # Empty page detection
+    empty_page = body.nil? || body.strip.empty? || body.length < 200
+    empty_page ||= (body.match(/<title[^>]*>\s*<\/title>/i) && body !~ /<body[^>]*>/im)
+
+    if empty_page && @bot.config['url.flaresolverr'] && !@bot.config['url.flaresolverr'].empty?
+      debug "Empty/placeholder page – trying FlareSolverr..."
+      return fetch_via_flaresolverr(url_str, @bot.config['url.flaresolverr'])
+    end
+
+    if body =~ /<title[^>]*>(?:Just a moment|Attention Required|DDOS Guardian|Access Denied|blocked|Challenge|Checking your browser)<\/title>/i
+      if @bot.config['url.flaresolverr'] && !@bot.config['url.flaresolverr'].empty?
+        debug "Bot challenge page – trying FlareSolverr..."
+        return fetch_via_flaresolverr(url_str, @bot.config['url.flaresolverr'])
+      end
+      raise "Bot protection page detected. Cannot retrieve content."
+    end
+
+    title_match = body.match(/<title[^>]*>(.*?)<\/title>/im)
+    title = title_match ? title_match[1].strip : nil
+    if title
+      title.gsub!(/&[a-z]+;/, ' ')
+      title.gsub!(/\s+/, ' ')
+    end
+
+      if og_match = body.match(/<meta\s+property=["']og:title["']\s+content=["'](.*?)["']/im)
+      og_title = og_match[1].strip
+      og_title.gsub!(/&[a-z]+;/, ' ')
+      og_title.gsub!(/\s+/, ' ')
+      title = og_title unless og_title.empty?
+    end
+
+    clean_title = title&.sub(/^Page title:\s*/i, '')
+    if clean_title && clean_title =~ /^\s*(403\s*Forbidden|Access\s*Denied|Blocked|Just\s*a\s*moment|Attention\s*Required|Challenge|Checking\s*your\s*browser)/i
+      if @bot.config['url.flaresolverr'] && !@bot.config['url.flaresolverr'].empty?
+        debug "Block/error page detected via title (#{title}), trying FlareSolverr..."
+        return fetch_via_flaresolverr(url_str, @bot.config['url.flaresolverr'])
+      end
+    end
+
+    first_par = nil
+    if @bot.config['url.first_par']
+      if body =~ /<(?:p|div)[^>]*>(.*?)(?:<\/(?:p|div)>|$)/mi
+        first_par = $1.strip.gsub(/<[^>]+>/, '').gsub(/\s+/, ' ')
+        first_par = first_par[0...@bot.config['url.first_par_length']]
+      end
+    end
+
+    {
+      headers: response.each_header.to_h,
+      title: title,
+      content: first_par,
+      body: body
+    }
+  end
 
   def get_title_from_html(pagedata)
     return pagedata.ircify_html_title
+  end
+
+  def extract_tweet_from_xcancel(body)
+    if body =~ /<meta\s+property=["']og:description["']\s+content=["'](.*?)["']/i
+      desc = $1.strip
+      desc.gsub!(/&(?:amp|lt|gt|quot|#39);/, '&' => '&', '<' => '<', '>' => '>', '"' => '"', "'" => "'")
+      desc.gsub!(/\s+/, ' ')
+      return desc unless desc.empty?
+    end
+
+    if body =~ /<div[^>]+class="[^"]*tweet-content[^"]*"[^>]*>(.*?)<\/div>/mi
+      text = $1.gsub(/<[^>]+>/, '').gsub(/\s+/, ' ').strip
+      return text unless text.empty?
+    end
+
+    if body =~ /<div[^>]+class="[^"]*tweet-text[^"]*"[^>]*>(.*?)<\/div>/mi
+      text = $1.gsub(/<[^>]+>/, '').gsub(/\s+/, ' ').strip
+      return text unless text.empty?
+    end
+
+    if m = body.match(/<title[^>]*>(.*?)<\/title>/i)
+      title = m[1].strip.gsub(/\s+/, ' ')
+      return "Page title: #{title}" unless title.empty?
+    end
+
+    nil
+  end
+
+  def try_nitter_fallback(url_str)
+    original_uri = URI.parse(url_str)
+    # Extract username and status ID from Twitter
+    if original_uri.path =~ /\/(\w+)\/status\/(\d+)/
+      username = $1
+      status_id = $2
+      NITTER_INSTANCES.shuffle.each do |instance|
+        nitter_url = "https://#{instance}/#{username}/status/#{status_id}"
+        debug "Trying Nitter fallback: #{nitter_url}"
+        begin
+          info = robust_fetch(nitter_url)
+          body = info[:body]
+          tweet = extract_tweet_from_xcancel(body)
+          return tweet if tweet
+        rescue => e
+          debug "Nitter fallback #{instance} failed: #{e.message}"
+        end
+      end
+    end
+    nil
   end
 
   def get_title_for_url(uri_str, opts = {})
@@ -192,7 +391,6 @@ end
       info = robust_fetch(url.to_s)
     rescue => e
       debug "robust_fetch failed: #{e.message}"
-      # Fallback to the original filter
       begin
         info = @bot.filter(:htmlinfo, url)
       rescue => e
@@ -200,9 +398,65 @@ end
       end
     end
 
+    # Force FlareSolverr
+    if url.host =~ /(^|\.)(twitter\.com|x\.com|xcancel\.com|nitter\.\w+|hitlerx\.com|yiffx\.com)$/i
+      if @bot.config['url.flaresolverr'] && !@bot.config['url.flaresolverr'].empty?
+        unless info[:body] && info[:body].length > 500 && info[:title] && !info[:title].empty?
+          debug "Re-fetching #{url} via FlareSolverr for full rendering..."
+          begin
+            fs_info = fetch_via_flaresolverr(url.to_s, @bot.config['url.flaresolverr'])
+            info = fs_info if fs_info[:body] && fs_info[:body].length > 500
+          rescue => e
+            debug "FlareSolverr force fetch failed: #{e.message}"
+          end
+        end
+      end
+    end
+
     title = info[:title]
     extra = []
     resp = info[:headers]
+
+    # Twitter/X mirror special handling
+    if url.host =~ /(^|\.)(twitter\.com|x\.com|xcancel\.com|nitter\.\w+|hitlerx\.com|yiffx\.com)$/i
+      if title.nil? || title.strip.empty?
+        debug "No title from Twitter/X page, trying tweet extraction..."
+        tweet_text = extract_tweet_from_xcancel(info[:body])
+        if tweet_text
+          title = tweet_text
+          title = title[0..200] + "…" if title.length > 200
+        end
+      end
+    end
+        # YouTube special handling – static HTML may have only " - YouTube"
+    if url.host =~ /(^|\.)(youtube\.com|youtu\.be|m\.youtube\.com|youtube-nocookie\.com)$/i
+      if title.nil? || title.strip.empty? || title =~ /^\s*-\s*YouTube\s*$/i
+        debug "YouTube placeholder title (#{title.inspect}), trying JSON-LD..."
+        real_title = extract_youtube_title(info[:body])
+        if real_title
+          title = real_title
+        else
+          # Fallback: try FlareSolverr
+          if @bot.config['url.flaresolverr'] && !@bot.config['url.flaresolverr'].empty?
+            debug "JSON-LD failed, forcing FlareSolverr for YouTube..."
+            begin
+              fs_info = fetch_via_flaresolverr(url.to_s, @bot.config['url.flaresolverr'])
+              if fs_info[:body]
+                title_match = fs_info[:body].match(/<title[^>]*>(.*?)<\/title>/im)
+                title = title_match[1].strip if title_match
+                # Clean up as usual
+                if title
+                  title.gsub!(/&[a-z]+;/, ' ')
+                  title.gsub!(/\s+/, ' ')
+                end
+              end
+            rescue => e
+              debug "FlareSolverr YouTube fallback failed: #{e.message}"
+            end
+          end
+        end
+      end
+    end
 
     if info[:content]
       max_length = @bot.config['url.first_par_length']
@@ -234,6 +488,19 @@ end
     if title
       extra.unshift("#{Bold}title#{Bold}: #{title}")
     end
+
+        if url.host =~ /(^|\.)(twitter\.com|x\.com|xcancel\.com|nitter\.\w+|hitlerx\.com|yiffx\.com|youtube\.com|youtu\.be|m\.youtube\.com|youtube-nocookie\.com)$/i
+      if title
+        return "title: #{title}"
+      else
+        fallback_tweet = try_nitter_fallback(url.to_s)
+        if fallback_tweet
+          return "title: #{fallback_tweet[0..200]}#{'…' if fallback_tweet.length > 200}"
+        end
+        return "No tweet text found"
+      end
+    end
+
     return extra.join(", ") if title or not @bot.config['url.titles_only']
   end
 
@@ -280,13 +547,7 @@ end
         reply = "#{LINK_INFO} #{title}" if title
       rescue => e
         debug e
-        # we might get a 404 because of trailing punctuation, so we try again
-        # with the last character stripped. this might generate invalid URIs
-        # (e.g. because "some.url" gets chopped to some.url%2, so catch that too
         if e.message =~ /\(404 - Not Found\)/i or e.kind_of?(URI::InvalidURIError)
-          # chop off last non-word character from the unescaped version of
-          # the URL, and retry if we still have enough string to look like a
-          # minimal URL
           unescaped = URI.unescape(urlstr)
           debug "Unescaped: #{unescaped}"
           if unescaped.sub!(/\W$/,'') and unescaped =~ /^https?:\/\/./
@@ -309,7 +570,6 @@ end
 
       next unless list
 
-      # check to see if this url is already listed
       next if list.find {|u| u.url == urlstr }
 
       url = Url.new(m.target, m.sourcenick, Time.new, urlstr, title)
@@ -353,7 +613,6 @@ end
         title = url.info ||
           get_title_for_url(url.url,
                             :nick => url.nick, :channel => channel) rescue nil
-        # If the url info was missing and we now have some, try to upgrade it
         if channel and title and not url.info
           ll = @registry[channel]
           debug ll
@@ -398,6 +657,12 @@ end
       reply_urls :msg => m, :channel => channel, :list => list, :max => max
     end
   end
+
+  def flaresolverr_reset(m, params)
+    @flaresolverr_failures = 0
+    @flaresolverr_disabled = false
+    m.reply "FlareSolverr counter reset; will be used again if configured."
+  end
 end
 
 plugin = UrlPlugin.new
@@ -417,3 +682,4 @@ plugin.map 'urls :channel :limit', :defaults => {:limit => 4},
 plugin.map 'urls :limit', :defaults => {:limit => 4},
                           :requirements => {:limit => /^\d+$/},
                           :private => false
+plugin.map 'url flaresolverr reset', :action => 'flaresolverr_reset', :private => false
