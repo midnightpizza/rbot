@@ -131,7 +131,7 @@ class UrlPlugin < Plugin
     "url info <url> => display link info for <url> (set url.display_link_info > 0 if you want the bot to do it automatically when someone writes an url), urls [<max>=4] => list <max> last urls mentioned in current channel, urls search [<max>=4] <regexp> => search for matching urls. In a private message, you must specify the channel to query, eg. urls <channel> [max], urls search <channel> [max] <regexp>. url flaresolverr reset => re-enable FlareSolverr after it has been automatically disabled."
   end
 
-  def fetch_via_flaresolverr(url_str, flaresolverr_url)
+  def fetch_via_flaresolverr(url_str, flaresolverr_url, session = nil)
     if @flaresolverr_disabled
       raise "FlareSolverr temporarily disabled due to repeated failures"
     end
@@ -145,9 +145,10 @@ class UrlPlugin < Plugin
     payload = {
       cmd: 'request.get',
       url: url_str,
-      maxTimeout: 30000,
-      session: 'rbot_twitter_session'
-    }.to_json
+      maxTimeout: 30000
+    }
+    payload[:session] = session if session
+    payload = payload.to_json
 
     begin
       debug "Requesting FlareSolverr: #{flaresolverr_url}"
@@ -191,7 +192,7 @@ class UrlPlugin < Plugin
       raise "FlareSolverr HTTP error #{response.code}"
     end
   end
-
+  
    def robust_fetch(url_str, redirect_limit = 5, cookie_jar = {})
     raise "Too many redirects" if redirect_limit == 0
 
