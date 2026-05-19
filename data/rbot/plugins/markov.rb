@@ -175,22 +175,38 @@ class MarkovPlugin < Plugin
     MARKER
   end
 
-  # Generate a completely random sentence
-  def generate_random_sentence
-    word1, word2 = MARKER, MARKER
-    output = []
-    @bot.config['markov.max_words'].times do
-      word3 = pick_word(word1, word2)
-      break if word3 == MARKER
-      output << word3
-      word1, word2 = word2, word3
-    end
-    return nil if output.length < 3
-    sentence = output.join(' ')
-    sentence[0] = sentence[0].capitalize
-    sentence << '.' unless sentence =~ /[.!?]$/
-    sentence
+def generate_random_sentence
+  return nil if @chains.empty?
+
+  word1, word2 = MARKER, MARKER
+  output = []
+  word3 = pick_word(word1, word2)
+
+  if word3 == MARKER
+    start_keys = @chains.keys.select { |k| k.start_with?("#{MARKER} ") }
+    start_keys = @chains.keys if start_keys.empty?
+    return nil if start_keys.empty?
+
+    random_key = start_keys.sample
+    parts = random_key.split
+    word1, word2 = parts[0].to_sym, parts[1].to_sym
+    output = [word1, word2] unless word1 == MARKER && word2 == MARKER
+    word3 = pick_word(word1, word2)
   end
+
+  @bot.config['markov.max_words'].times do
+    break if word3 == MARKER
+    output << word3
+    word1, word2 = word2, word3
+    word3 = pick_word(word1, word2)
+  end
+
+  return nil if output.length < 3
+  sentence = output.join(' ')
+  sentence[0] = sentence[0].capitalize
+  sentence << '.' unless sentence =~ /[.!?]$/
+  sentence
+end
 
   # Generate from an exact two‑word seed
   def generate_from_pair(w1, w2)
