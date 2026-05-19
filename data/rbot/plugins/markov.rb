@@ -75,7 +75,6 @@ class MarkovPlugin < Plugin
       @bot.config.delete('markov.ignore_users'.to_sym)
     end
 
-    # In‑memory hashes (empty at first)
     @chains = {}
     @rchains = {}
     @chains_mutex = Mutex.new
@@ -107,10 +106,8 @@ class MarkovPlugin < Plugin
     end
     @learning_thread.priority = -1
 
-    # Periodic save
     @save_timer = @bot.timer.add(30) { save_chains }
 
-    # History buffer
     @history = {}
     @history_mutex = Mutex.new
   end
@@ -175,40 +172,51 @@ class MarkovPlugin < Plugin
     MARKER
   end
 
-def generate_random_sentence
-  return nil if @chains.empty?
+  def generate_random_sentence
+    word1, word2 = MARKER, MARKER
+    output = []
 
-  word1, word2 = MARKER, MARKER
-  output = []
-  word3 = pick_word(word1, word2)
+    word3 = pick_word(word1, word2)
+    if word3 == MARKER
+      start_keys = @chains.keys.select { |k| k.start_with?("#{MARKER} ") }
+      start_keys = @chains.keys if start_keys.empty?
+      return nil if start_keys.empty?
+      
+      key = start_keys.sample
+      parts = key.split
+      word1, word2 = parts[0].to_sym, parts[1].to_sym
+      word3 = pick_word(word1, word2)
+      return nil if word3 == MARKER
+    end
+    
+    @bot.config['markov.max_words'].times do
+      break if word3 == MARKER
+      output << word3
+      word1, word2 = word2, word3
+      word3 = pick_word(word1, word2)
+    end
+    
+    return nil if output.length < 3
+    sentence = output.join(' ')
+    sentence[0] = sentence[0].capitalize
+    sentence << '.' unless sentence =~ /[.!?]$/
+    sentence
+  end
 
-  if word3 == MARKER
-    start_keys = @chains.keys.select { |k| k.start_with?("#{MARKER} ") }
-    start_keys = @chains.keys if start_keys.empty?
-    return nil if start_keys.empty?
-
-    random_key = start_keys.sample
-    parts = random_key.split
+  def generate_simple_sentence
+    return nil if @chains.empty?
+    key = @chains.keys.sample
+    parts = key.split
     word1, word2 = parts[0].to_sym, parts[1].to_sym
-    output = [word1, word2] unless word1 == MARKER && word2 == MARKER
     word3 = pick_word(word1, word2)
+    return nil if word3 == MARKER
+    sentence = "#{word1} #{word2} #{word3}"
+    sentence = sentence.gsub(/^\r\n /, '').gsub(/\r\n/, '')
+    sentence[0] = sentence[0].capitalize
+    sentence << '.' unless sentence =~ /[.!?]$/
+    sentence
   end
 
-  @bot.config['markov.max_words'].times do
-    break if word3 == MARKER
-    output << word3
-    word1, word2 = word2, word3
-    word3 = pick_word(word1, word2)
-  end
-
-  return nil if output.length < 3
-  sentence = output.join(' ')
-  sentence[0] = sentence[0].capitalize
-  sentence << '.' unless sentence =~ /[.!?]$/
-  sentence
-end
-
-  # Generate from an exact two‑word seed
   def generate_from_pair(w1, w2)
     key = "#{w1} #{w2}"
     return nil unless @chains.key?(key)
@@ -226,7 +234,6 @@ end
     sentence
   end
 
-  # Generate a sentence containing a specific word
   def generate_containing_word(word)
     candidates = []
     @chains.each_key do |key|
@@ -241,7 +248,6 @@ end
     generate_from_pair(word, w2)
   end
 
-  # Fallback: use channel history
   def generate_from_history(channel, seed_words)
     return nil unless channel && @history[channel] && !@history[channel].empty?
     seeds = seed_words.is_a?(Array) ? seed_words : [seed_words]
@@ -577,6 +583,9 @@ end
 
   def rand_chat(m, params)
     line = generate_random_sentence
+    unless line
+      line = generate_simple_sentence
+    end
     if line
       m.reply line
     else
